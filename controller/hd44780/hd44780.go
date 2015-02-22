@@ -87,15 +87,36 @@ type HD44780 struct {
 	eMode entryMode
 	dMode displayMode
 	fMode functionMode
+	cols  int
+	rows  int
 }
 
 // NewGPIO creates a new HD44780 connected by a 4-bit GPIO bus.
 func NewGPIO(
-	rs, en, d4, d5, d6, d7, backlight embd.DigitalPin,
+	rs, en, d4, d5, d6, d7, backlight interface{},
 	blPolarity Polarity,
+	cols, rows int,
 	modes ...ModeSetter,
 ) (*HD44780, error) {
-	pins := []embd.DigitalPin{rs, en, d4, d5, d6, d7, backlight}
+	pinKeys := []interface{}{rs, en, d4, d5, d6, d7, backlight}
+	pins := [7]embd.DigitalPin{}
+	for idx, key := range pinKeys {
+		if key == nil {
+			continue
+		}
+		var digitalPin embd.DigitalPin
+		if pin, ok := key.(embd.DigitalPin); ok {
+			digitalPin = pin
+		} else {
+			var err error
+			digitalPin, err = embd.NewDigitalPin(key)
+			if err != nil {
+				glog.V(1).Infof("hd44780: error creating digital pin %+v: %s", key, err)
+				return nil, err
+			}
+		}
+		pins[idx] = digitalPin
+	}
 	for _, pin := range pins {
 		if pin == nil {
 			continue
@@ -107,29 +128,48 @@ func NewGPIO(
 		}
 	}
 	return New(
-		NewGPIOConnection(rs, en, d4, d5, d6, d7, backlight, blPolarity),
+		NewGPIOConnection(
+			pins[0],
+			pins[1],
+			pins[2],
+			pins[3],
+			pins[4],
+			pins[5],
+			pins[6],
+			blPolarity),
+		cols,
+		rows,
 		modes...,
 	)
 }
 
 // NewI2C creates a new HD44780 connected by an I²C bus.
-func NewI2C(i2c embd.I2CBus, addr byte, pinMap I2CPinMap, modes ...ModeSetter) (*HD44780, error) {
-	return New(NewI2CConnection(i2c, addr, pinMap), modes...)
+func NewI2C(
+	i2c embd.I2CBus,
+	addr byte,
+	pinMap I2CPinMap,
+	cols int,
+	rows int,
+	modes ...ModeSetter,
+) (*HD44780, error) {
+	return New(NewI2CConnection(i2c, addr, pinMap), cols, rows, modes...)
 }
 
 // New creates a new HD44780 connected by a Connection bus.
-func New(bus Connection, modes ...ModeSetter) (*HD44780, error) {
+func New(bus Connection, cols, rows int, modes ...ModeSetter) (*HD44780, error) {
 	controller := &HD44780{
 		Connection: bus,
 		eMode:      0x00,
 		dMode:      0x00,
 		fMode:      0x00,
+		cols:       cols,
+		rows:       rows,
 	}
 	err := controller.lcdInit()
 	if err != nil {
 		return nil, err
 	}
-	err = controller.SetMode(modes...)
+	err = controller.SetMode(append(DefaultModes, modes...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -144,6 +184,18 @@ func (controller *HD44780) lcdInit() error {
 	}
 	glog.V(2).Info("hd44780: initializing display in 4-bit mode")
 	return controller.WriteInstruction(lcdInit4bit)
+}
+
+// DefaultModes are the default initialization modes for an HD44780.
+var DefaultModes []ModeSetter = []ModeSetter{
+	FourBitMode,
+	OneLine,
+	Dots5x8,
+	EntryIncrement,
+	EntryShiftOff,
+	DisplayOn,
+	CursorOff,
+	BlinkOff,
 }
 
 // ModeSetter defines a function used for setting modes on an HD44780.
@@ -223,6 +275,14 @@ func (hd *HD44780) TwoLineEnabled() bool { return hd.fMode&lcd2Line > 0 }
 
 // Dots5x10Enabled returns true if 5x10-pixel characters are enabled.
 func (hd *HD44780) Dots5x10Enabled() bool { return hd.fMode&lcd5x8Dots > 0 }
+
+func (hd *HD44780) IsLeftToRight() bool {
+	// EntryIncrement and EntryShiftOn is right-to-left
+	// EntryDecrement and EntryShiftOn is left-to-right
+	// EntryIncrement and EntryShiftOff is left-to-right
+	// EntryDecrement and EntryShiftOff is right-to-left
+	return hd.EntryIncrementEnabled() != hd.EntryShiftEnabled()
+}
 
 // SetModes modifies the entry mode, display mode, and function mode with the
 // given mode setter functions.
@@ -312,12 +372,40 @@ func (hd *HD44780) Home() error {
 // Clear clears the display and mode settings sets the cursor to the home position.
 func (hd *HD44780) Clear() error {
 	err := hd.WriteInstruction(lcdClearDisplay)
+	if err != nil {
+		return err
+	}
 	time.Sleep(clearDelay)
-	return err
+	// have to set mode here because clear also clears some mode settings
+	return hd.SetMode()
 }
 
-// SetCursor sets the input cursor to the given bye.
-func (hd *HD44780) SetCursor(value byte) error {
+func (hd *HD44780) Cols() int { return hd.cols }
+
+func (hd *HD44780) Rows() int { return hd.rows }
+
+// SetCursor sets the input cursor to the given position.
+func (hd *HD44780) SetCursor(col, row int) error {
+	return hd.SetDDRamAddr(byte(col) + hd.lcdRowOffset(row))
+}
+
+func (hd *HD44780) lcdRowOffset(row int) byte {
+	// Offset for up to 4 rows
+	if row > 3 {
+		row = 3
+	}
+	switch hd.cols {
+	case 16:
+		// 16-char line mappings
+		return []byte{0x00, 0x40, 0x10, 0x50}[row]
+	default:
+		// default to the 20-char line mappings
+		return []byte{0x00, 0x40, 0x14, 0x54}[row]
+	}
+}
+
+// SetDDRamAddr sets the input cursor to the given address.
+func (hd *HD44780) SetDDRamAddr(value byte) error {
 	return hd.WriteInstruction(lcdSetDDRamAddr | value)
 }
 
